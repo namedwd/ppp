@@ -278,7 +278,7 @@ app.post('/get-video-url', async (req, res) => {
 });
 
 // 비디오 조회용 Presigned URL 발급 (인증 없는 버전)
-app.post('/get-video-url-public', async (req, res) => {
+app.post('/get-video-url-noauth', async (req, res) => {
   try {
     const { key } = req.body;
     
@@ -296,7 +296,7 @@ app.post('/get-video-url-public', async (req, res) => {
       expiresIn: 3600, // 1시간
     });
     
-    console.log(`Public video URL generated for key: ${key}`);
+    console.log(`Video URL generated (no auth) for key: ${key}`);
     
     res.json({
       url,
