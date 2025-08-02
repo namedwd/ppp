@@ -41,7 +41,7 @@ const r2Client = new S3Client({
 });
 
 // Rate limiting 함수
-function checkRateLimit(userId, limit = 10, windowMinutes = 1) {
+function checkRateLimit(userId, limit = parseInt(process.env.RATE_LIMIT_REQUESTS || '10'), windowMinutes = parseInt(process.env.RATE_LIMIT_WINDOW || '1')) {
   const now = Date.now();
   const windowMs = windowMinutes * 60 * 1000;
   const key = `user:${userId}`;
@@ -112,8 +112,8 @@ app.post('/get-upload-url', async (req, res) => {
       return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
     }
     
-    // Rate limiting 확인 (1분에 10개)
-    if (!checkRateLimit(user.id, 10, 1)) {
+    // Rate limiting 확인 (1분에 60개로 증가)
+    if (!checkRateLimit(user.id, 60, 1)) {
       return res.status(429).json({ 
         error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.',
         retryAfter: 60 
