@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
@@ -207,6 +207,72 @@ app.post('/confirm-upload', async (req, res) => {
     
   } catch (error) {
     console.error('Confirm upload error:', error);
+    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
+// 비디오 조회용 Presigned URL 발급 엔드포인트
+app.post('/get-video-url', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '인증이 필요합니다.' });
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
+    }
+    
+    const { key } = req.body;
+    
+    if (!key) {
+      return res.status(400).json({ error: 'key가 필요합니다.' });
+    }
+    
+    // 권한 확인: 본인 영상인지 또는 관리자인지 확인
+    const { data: packing, error: dbError } = await supabase
+      .from('packings')
+      .select('user_id')
+      .eq('video_key', key)
+      .single();
+    
+    if (dbError || !packing) {
+      return res.status(404).json({ error: '영상을 찾을 수 없습니다.' });
+    }
+    
+    // 관리자 권한 확인
+    const adminDomains = process.env.ADMIN_EMAIL_DOMAINS ? process.env.ADMIN_EMAIL_DOMAINS.split(',') : [];
+    const userDomain = user.email.split('@')[1];
+    const isAdmin = adminDomains.length > 0 && adminDomains.includes(userDomain);
+    
+    // 본인 영상이 아니고 관리자도 아니면 거부
+    if (packing.user_id !== user.id && !isAdmin) {
+      return res.status(403).json({ error: '접근 권한이 없습니다.' });
+    }
+    
+    // Presigned URL 생성 (1시간 유효)
+    const command = new GetObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key
+    });
+    
+    const url = await getSignedUrl(r2Client, command, {
+      expiresIn: 3600, // 1시간
+    });
+    
+    console.log(`Video URL generated for user ${user.email}, key: ${key}`);
+    
+    res.json({
+      url,
+      expiresIn: 3600,
+      message: '비디오 URL이 생성되었습니다.'
+    });
+    
+  } catch (error) {
+    console.error('Get video URL error:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });
