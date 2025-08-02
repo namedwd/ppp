@@ -7,9 +7,22 @@ const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
 
+// Rate limiting을 위한 메모리 저장소
+const requestCounts = new Map();
+const uploadLogs = [];
+
 // 미들웨어
-app.use(cors());
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+  credentials: true
+}));
 app.use(express.json());
+
+// IP 추출 미들웨어
+app.use((req, res, next) => {
+  req.clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  next();
+});
 
 // Supabase 클라이언트 초기화
 const supabase = createClient(
@@ -27,44 +40,57 @@ const r2Client = new S3Client({
   },
 });
 
+// Rate limiting 함수
+function checkRateLimit(userId, limit = 10, windowMinutes = 1) {
+  const now = Date.now();
+  const windowMs = windowMinutes * 60 * 1000;
+  const key = `user:${userId}`;
+  
+  if (!requestCounts.has(key)) {
+    requestCounts.set(key, []);
+  }
+  
+  const userRequests = requestCounts.get(key);
+  const recentRequests = userRequests.filter(time => now - time < windowMs);
+  
+  requestCounts.set(key, recentRequests);
+  
+  if (recentRequests.length >= limit) {
+    return false;
+  }
+  
+  recentRequests.push(now);
+  return true;
+}
+
+// 업로드 로그 기록
+function logUpload(userId, email, fileName, fileSize, ip) {
+  const log = {
+    userId,
+    email,
+    fileName,
+    fileSize,
+    ip,
+    timestamp: new Date().toISOString()
+  };
+  
+  uploadLogs.push(log);
+  
+  // 최근 1000개만 유지
+  if (uploadLogs.length > 1000) {
+    uploadLogs.shift();
+  }
+  
+  console.log('Upload log:', log);
+}
+
 // 헬스 체크
 app.get('/', (req, res) => {
-  res.json({ status: 'Packing Server is running!' });
-});
-
-// 로그인 엔드포인트
-app.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    
-    if (!email || !password) {
-      return res.status(400).json({ error: '이메일과 비밀번호가 필요합니다.' });
-    }
-    
-    // Supabase 로그인
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password
-    });
-    
-    if (error) {
-      console.error('Login error:', error);
-      return res.status(401).json({ error: error.message });
-    }
-    
-    // 성공 시 토큰 반환
-    res.json({
-      token: data.session.access_token,
-      user: {
-        id: data.user.id,
-        email: data.user.email
-      }
-    });
-    
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
-  }
+  res.json({ 
+    status: 'Packing Server is running!',
+    version: '1.0.0',
+    environment: process.env.NODE_ENV || 'development'
+  });
 });
 
 // Presigned URL 발급 엔드포인트
@@ -86,8 +112,16 @@ app.post('/get-upload-url', async (req, res) => {
       return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
     }
     
+    // Rate limiting 확인 (1분에 10개)
+    if (!checkRateLimit(user.id, 10, 1)) {
+      return res.status(429).json({ 
+        error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.',
+        retryAfter: 60 
+      });
+    }
+    
     // 요청 본문에서 파일명 추출
-    const { fileName, fileType = 'video/webm' } = req.body;
+    const { fileName, fileType = 'video/webm', fileSize } = req.body;
     
     if (!fileName) {
       return res.status(400).json({ error: 'fileName이 필요합니다.' });
@@ -113,23 +147,10 @@ app.post('/get-upload-url', async (req, res) => {
       expiresIn: 3600, // 1시간
     });
     
-    console.log(`Presigned URL generated for user ${user.email}`);
+    // 업로드 로그 기록
+    logUpload(user.id, user.email, fileName, fileSize || 0, req.clientIp);
     
-    // Supabase에 업로드 예정 기록 (선택사항)
-    try {
-      await supabase.from('packings').insert({
-        barcode: safeFileName.split('.')[0],
-        video_url: `https://your-r2-public-domain/${key}`, // R2 공개 도메인 설정 필요
-        video_key: key,
-        started_at: new Date().toISOString(),
-        ended_at: new Date().toISOString(),
-        file_size: 0, // 실제 업로드 후 업데이트 필요
-        duration_seconds: 0 // 실제 업로드 후 업데이트 필요
-      });
-    } catch (dbError) {
-      console.error('DB insert error:', dbError);
-      // DB 오류가 있어도 URL은 반환
-    }
+    console.log(`Presigned URL generated for user ${user.email}`);
     
     res.json({
       uploadUrl,
@@ -144,36 +165,83 @@ app.post('/get-upload-url', async (req, res) => {
   }
 });
 
-// 업로드 확인 엔드포인트 (선택사항)
+// 업로드 확인 엔드포인트
 app.post('/confirm-upload', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader) {
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ error: '인증이 필요합니다.' });
     }
     
     const token = authHeader.replace('Bearer ', '');
-    const { data: { user } } = await supabase.auth.getUser(token);
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     
-    if (!user) {
+    if (authError || !user) {
       return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
     }
     
-    const { key, fileSize, duration } = req.body;
+    const { key, fileSize, duration, barcode, started_at, ended_at } = req.body;
     
-    // Supabase 업데이트
-    await supabase
-      .from('packings')
-      .update({
-        file_size: fileSize,
-        duration_seconds: duration
-      })
-      .eq('video_key', key);
+    if (!key || !barcode) {
+      return res.status(400).json({ error: '필수 필드가 누락되었습니다.' });
+    }
+    
+    // Supabase에 업로드 정보 저장
+    const { error: insertError } = await supabase.from('packings').insert({
+      barcode,
+      video_url: `https://${process.env.R2_PUBLIC_DOMAIN || process.env.R2_BUCKET_NAME + '.r2.dev'}/${key}`,
+      video_key: key,
+      started_at: started_at || new Date().toISOString(),
+      ended_at: ended_at || new Date().toISOString(),
+      file_size: fileSize || 0,
+      duration_seconds: duration || 0,
+      user_id: user.id
+    });
+    
+    if (insertError) {
+      console.error('DB insert error:', insertError);
+      return res.status(500).json({ error: 'DB 저장 중 오류가 발생했습니다.' });
+    }
     
     res.json({ message: '업로드가 확인되었습니다.' });
     
   } catch (error) {
     console.error('Confirm upload error:', error);
+    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
+// 업로드 로그 조회 엔드포인트 (관리자용)
+app.get('/admin/upload-logs', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: '인증이 필요합니다.' });
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
+    }
+    
+    // 관리자 권한 확인 (예: 특정 이메일 도메인 확인)
+    const adminDomains = process.env.ADMIN_EMAIL_DOMAINS ? process.env.ADMIN_EMAIL_DOMAINS.split(',') : [];
+    const userDomain = user.email.split('@')[1];
+    
+    if (adminDomains.length > 0 && !adminDomains.includes(userDomain)) {
+      return res.status(403).json({ error: '관리자 권한이 필요합니다.' });
+    }
+    
+    // 최근 업로드 로그 반환
+    res.json({
+      logs: uploadLogs.slice(-100), // 최근 100개
+      total: uploadLogs.length
+    });
+    
+  } catch (error) {
+    console.error('Get upload logs error:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });
