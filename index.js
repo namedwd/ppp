@@ -188,8 +188,7 @@ app.post('/confirm-upload', async (req, res) => {
     
     // Supabase에 업로드 정보 저장
     const { error: insertError } = await supabase.from('packings').insert({
-      barcode,
-      video_url: `https://${process.env.R2_PUBLIC_DOMAIN || process.env.R2_BUCKET_NAME + '.r2.dev'}/${key}`,
+      barcode,      
       video_key: key,
       started_at: started_at || new Date().toISOString(),
       ended_at: ended_at || new Date().toISOString(),
