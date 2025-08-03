@@ -13,21 +13,7 @@ const uploadLogs = [];
 
 // 미들웨어
 app.use(cors({
-  origin: function(origin, callback) {
-    // Electron 앱(file:// 프로토콜) 또는 환경변수에 설정된 origin 허용
-    if (!origin || origin.startsWith('file://')) {
-      callback(null, true);
-    } else if (process.env.ALLOWED_ORIGINS) {
-      const allowedOrigins = process.env.ALLOWED_ORIGINS.split(',');
-      if (allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    } else {
-      callback(null, true); // 개발 환경에서는 모든 origin 허용
-    }
-  },
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
   credentials: true
 }));
 app.use(express.json());
