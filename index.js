@@ -211,6 +211,38 @@ app.post('/confirm-upload', async (req, res) => {
   }
 });
 
+// 비디오 조회용 Presigned URL 발급 (GET 방식)
+app.get('/api/video-url/:key', async (req, res) => {
+  try {
+    const { key } = req.params;
+    
+    if (!key) {
+      return res.status(400).json({ error: 'key가 필요합니다.' });
+    }
+    
+    // Presigned URL 생성 (1시간 유효)
+    const command = new GetObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key
+    });
+    
+    const url = await getSignedUrl(r2Client, command, {
+      expiresIn: 3600, // 1시간
+    });
+    
+    console.log(`Video URL generated for key: ${key}`);
+    
+    res.json({
+      url,
+      expiresIn: 3600
+    });
+    
+  } catch (error) {
+    console.error('Get video URL error:', error);
+    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
 // 비디오 조회용 Presigned URL 발급 엔드포인트
 app.post('/get-video-url', async (req, res) => {
   try {
