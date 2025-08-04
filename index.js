@@ -187,6 +187,13 @@ app.post('/confirm-upload', async (req, res) => {
     }
     
     // Supabase에 업로드 정보 저장
+    // 먼저 사용자의 company_id 가져오기
+    const { data: userProfile } = await supabase
+      .from('user_profiles')
+      .select('company_id')
+      .eq('id', user.id)
+      .single();
+    
     const { error: insertError } = await supabase.from('packings').insert({
       barcode,      
       video_key: key,
@@ -194,7 +201,8 @@ app.post('/confirm-upload', async (req, res) => {
       ended_at: ended_at || new Date().toISOString(),
       file_size: fileSize || 0,
       duration_seconds: duration || 0,
-      user_id: user.id
+      user_profile_id: user.id,  // user_id 대신 user_profile_id 사용
+      company_id: userProfile?.company_id || null
     });
     
     if (insertError) {
@@ -266,7 +274,7 @@ app.post('/get-video-url', async (req, res) => {
     // 권한 확인: 본인 영상인지 또는 관리자인지 확인
     const { data: packing, error: dbError } = await supabase
       .from('packings')
-      .select('user_id')
+      .select('user_profile_id')  // user_id 대신 user_profile_id
       .eq('video_key', key)
       .single();
     
@@ -280,7 +288,7 @@ app.post('/get-video-url', async (req, res) => {
     const isAdmin = adminDomains.length > 0 && adminDomains.includes(userDomain);
     
     // 본인 영상이 아니고 관리자도 아니면 거부
-    if (packing.user_id !== user.id && !isAdmin) {
+    if (packing.user_profile_id !== user.id && !isAdmin) {  // user_id 대신 user_profile_id
       return res.status(403).json({ error: '접근 권한이 없습니다.' });
     }
     
