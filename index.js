@@ -4,6 +4,8 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -93,27 +95,237 @@ app.get('/', (req, res) => {
   });
 });
 
-// Presigned URL 발급 엔드포인트
-app.post('/get-upload-url', async (req, res) => {
+// 작업자 로그인 엔드포인트
+app.post('/worker-login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  if (!username || !password) {
+    return res.status(400).json({ error: '아이디와 비밀번호를 입력해주세요.' });
+  }
+  
   try {
-    // Authorization 헤더 확인
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: '인증 토큰이 필요합니다.' });
+    // 작업자 찾기
+    const { data: workers, error: searchError } = await supabase
+      .from('worker_accounts')
+      .select(`
+        *,
+        companies(*)
+      `)
+      .eq('username', username)
+      .eq('is_active', true);
+    
+    if (searchError || !workers || workers.length === 0) {
+      console.error('Worker search error:', searchError);
+      return res.status(401).json({ error: '아이디 또는 비밀번호가 올바르지 않습니다.' });
     }
     
-    const token = authHeader.replace('Bearer ', '');
+    // 비밀번호 확인
+    let validWorker = null;
+    for (const worker of workers) {
+      try {
+        const isValid = await bcrypt.compare(password, worker.password_hash);
+        if (isValid) {
+          validWorker = worker;
+          break;
+        }
+      } catch (err) {
+        console.error('Bcrypt compare error:', err);
+      }
+    }
     
-    // 토큰 검증
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (!validWorker) {
+      return res.status(401).json({ error: '아이디 또는 비밀번호가 올바르지 않습니다.' });
+    }
+    
+    // 회사 구독 상태 확인
+    if (validWorker.companies.subscription_status !== 'active') {
+      return res.status(403).json({ error: '회사 구독이 만료되었습니다.' });
+    }
+    
+    if (validWorker.companies.expires_at && new Date(validWorker.companies.expires_at) < new Date()) {
+      return res.status(403).json({ error: '회사 라이선스가 만료되었습니다.' });
+    }
+    
+    // 기존 세션 정리
+    await supabase
+      .from('worker_sessions')
+      .delete()
+      .eq('worker_id', validWorker.id)
+      .lt('expires_at', new Date().toISOString());
+    
+    // 새 세션 토큰 생성
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    
+    // 세션 저장
+    const { error: sessionError } = await supabase
+      .from('worker_sessions')
+      .insert({
+        worker_id: validWorker.id,
+        session_token: sessionToken,
+        device_id: req.body.deviceId || req.clientIp
+      });
+    
+    if (sessionError) {
+      console.error('Session creation error:', sessionError);
+      return res.status(500).json({ error: '세션 생성 실패' });
+    }
+    
+    // 로그인 시간 업데이트
+    await supabase
+      .from('worker_accounts')
+      .update({ last_login_at: new Date().toISOString() })
+      .eq('id', validWorker.id);
+    
+    console.log(`Worker login successful: ${validWorker.username} from company ${validWorker.companies.name}`);
+    
+    res.json({
+      sessionToken,
+      workerInfo: {
+        id: validWorker.id,
+        username: validWorker.username,
+        displayName: validWorker.display_name || validWorker.username,
+        companyId: validWorker.company_id,
+        companyName: validWorker.companies.name
+      }
+    });
+    
+  } catch (error) {
+    console.error('Worker login error:', error);
+    res.status(500).json({ error: '로그인 처리 중 오류가 발생했습니다.' });
+  }
+});
+
+// 작업자 인증 미들웨어
+async function authenticateWorker(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: '인증 토큰이 필요합니다.' });
+  }
+  
+  const token = authHeader.replace('Bearer ', '');
+  
+  try {
+    // 세션 확인
+    const { data: session, error: sessionError } = await supabase
+      .from('worker_sessions')
+      .select(`
+        *,
+        worker_accounts(
+          *,
+          companies(*)
+        )
+      `)
+      .eq('session_token', token)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+    
+    if (sessionError || !session) {
+      console.error('Session lookup error:', sessionError);
+      return res.status(401).json({ error: '세션이 만료되었거나 유효하지 않습니다.' });
+    }
+    
+    // 활성 상태 확인
+    if (!session.worker_accounts.is_active) {
+      return res.status(403).json({ error: '비활성화된 계정입니다.' });
+    }
+    
+    // 요청 객체에 작업자 정보 추가
+    req.worker = session.worker_accounts;
+    req.company = session.worker_accounts.companies;
+    
+    next();
+  } catch (error) {
+    console.error('Worker auth error:', error);
+    res.status(500).json({ error: '인증 처리 중 오류가 발생했습니다.' });
+  }
+}
+
+// 관리자 전용 - 작업자 계정 생성
+app.post('/api/admin/create-worker', async (req, res) => {
+  try {
+    // Supabase Auth 토큰 확인
+    const authToken = req.headers.authorization?.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(authToken);
     
     if (authError || !user) {
-      console.error('Auth error:', authError);
-      return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
+      return res.status(401).json({ error: '관리자 인증이 필요합니다.' });
     }
     
+    // 관리자의 회사 찾기
+    const { data: company, error: companyError } = await supabase
+      .from('companies')
+      .select('id, max_workers')
+      .eq('owner_id', user.id)
+      .single();
+    
+    if (companyError || !company) {
+      return res.status(403).json({ error: '회사 정보를 찾을 수 없습니다.' });
+    }
+    
+    // 현재 작업자 수 확인
+    const { count } = await supabase
+      .from('worker_accounts')
+      .select('*', { count: 'exact', head: true })
+      .eq('company_id', company.id)
+      .eq('is_active', true);
+    
+    if (count >= company.max_workers) {
+      return res.status(403).json({ 
+        error: `최대 작업자 수(${company.max_workers}명)에 도달했습니다.` 
+      });
+    }
+    
+    const { username, password, displayName } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json({ error: '아이디와 비밀번호는 필수입니다.' });
+    }
+    
+    // 비밀번호 해시
+    const passwordHash = await bcrypt.hash(password, 10);
+    
+    // 작업자 생성
+    const { data: newWorker, error: insertError } = await supabase
+      .from('worker_accounts')
+      .insert({
+        company_id: company.id,
+        username,
+        password_hash: passwordHash,
+        display_name: displayName || username,
+        created_by: user.id
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      if (insertError.code === '23505') {
+        return res.status(400).json({ error: '이미 존재하는 아이디입니다.' });
+      }
+      throw insertError;
+    }
+    
+    console.log(`Worker account created: ${username} for company ${company.id}`);
+    
+    res.json({ 
+      success: true,
+      worker: {
+        id: newWorker.id,
+        username: newWorker.username,
+        displayName: newWorker.display_name
+      }
+    });
+    
+  } catch (error) {
+    console.error('Create worker error:', error);
+    res.status(500).json({ error: '작업자 생성 중 오류가 발생했습니다.' });
+  }
+});
+
+// Presigned URL 발급 엔드포인트 (작업자 인증 사용)
+app.post('/get-upload-url', authenticateWorker, async (req, res) => {
+  try {
     // Rate limiting 확인 (1분에 60개로 증가)
-    if (!checkRateLimit(user.id, 60, 1)) {
+    if (!checkRateLimit(`worker:${req.worker.id}`, 60, 1)) {
       return res.status(429).json({ 
         error: '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.',
         retryAfter: 60 
@@ -130,7 +342,7 @@ app.post('/get-upload-url', async (req, res) => {
     // 파일명 안전성 검사
     const safeFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, '_');
     const timestamp = new Date().toISOString().replace(/:/g, '-');
-    const key = `recordings/${user.id}/${timestamp}-${safeFileName}`;
+    const key = `recordings/${req.company.id}/${req.worker.id}/${timestamp}-${safeFileName}`;
     
     // Presigned URL 생성
     const command = new PutObjectCommand({
@@ -138,7 +350,8 @@ app.post('/get-upload-url', async (req, res) => {
       Key: key,
       ContentType: fileType,
       Metadata: {
-        'user-id': user.id,
+        'company-id': req.company.id,
+        'worker-id': req.worker.id,
         'uploaded-at': new Date().toISOString()
       }
     });
@@ -148,9 +361,9 @@ app.post('/get-upload-url', async (req, res) => {
     });
     
     // 업로드 로그 기록
-    logUpload(user.id, user.email, fileName, fileSize || 0, req.clientIp);
+    logUpload(req.worker.id, req.worker.username, fileName, fileSize || 0, req.clientIp);
     
-    console.log(`Presigned URL generated for user ${user.email}`);
+    console.log(`Presigned URL generated for worker ${req.worker.username}`);
     
     res.json({
       uploadUrl,
@@ -166,19 +379,8 @@ app.post('/get-upload-url', async (req, res) => {
 });
 
 // 업로드 확인 엔드포인트
-app.post('/confirm-upload', async (req, res) => {
+app.post('/confirm-upload', authenticateWorker, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: '인증이 필요합니다.' });
-    }
-    
-    const token = authHeader.replace('Bearer ', '');
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    
-    if (authError || !user) {
-      return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
-    }
     
     const { key, fileSize, duration, barcode, started_at, ended_at } = req.body;
     
@@ -187,13 +389,6 @@ app.post('/confirm-upload', async (req, res) => {
     }
     
     // Supabase에 업로드 정보 저장
-    // 먼저 사용자의 company_id 가져오기
-    const { data: userProfile } = await supabase
-      .from('user_profiles')
-      .select('company_id')
-      .eq('id', user.id)
-      .single();
-    
     const { error: insertError } = await supabase.from('packings').insert({
       barcode,      
       video_key: key,
@@ -201,8 +396,9 @@ app.post('/confirm-upload', async (req, res) => {
       ended_at: ended_at || new Date().toISOString(),
       file_size: fileSize || 0,
       duration_seconds: duration || 0,
-      user_profile_id: user.id,  // user_id 대신 user_profile_id 사용
-      company_id: userProfile?.company_id || null
+      worker_id: req.worker.id,  // 작업자 ID
+      company_id: req.company.id,
+      uploaded_by_type: 'worker' // 작업자가 업로드
     });
     
     if (insertError) {
@@ -251,19 +447,8 @@ app.get('/api/video-url/:key', async (req, res) => {
 });
 
 // 비디오 조회용 Presigned URL 발급 엔드포인트
-app.post('/get-video-url', async (req, res) => {
+app.post('/get-video-url', authenticateWorker, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: '인증이 필요합니다.' });
-    }
-    
-    const token = authHeader.replace('Bearer ', '');
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    
-    if (authError || !user) {
-      return res.status(401).json({ error: '유효하지 않은 토큰입니다.' });
-    }
     
     const { key } = req.body;
     
@@ -271,10 +456,10 @@ app.post('/get-video-url', async (req, res) => {
       return res.status(400).json({ error: 'key가 필요합니다.' });
     }
     
-    // 권한 확인: 본인 영상인지 또는 관리자인지 확인
+    // 권한 확인: 같은 회사의 영상인지 확인
     const { data: packing, error: dbError } = await supabase
       .from('packings')
-      .select('user_profile_id')  // user_id 대신 user_profile_id
+      .select('company_id, worker_id')
       .eq('video_key', key)
       .single();
     
@@ -282,13 +467,8 @@ app.post('/get-video-url', async (req, res) => {
       return res.status(404).json({ error: '영상을 찾을 수 없습니다.' });
     }
     
-    // 관리자 권한 확인
-    const adminDomains = process.env.ADMIN_EMAIL_DOMAINS ? process.env.ADMIN_EMAIL_DOMAINS.split(',') : [];
-    const userDomain = user.email.split('@')[1];
-    const isAdmin = adminDomains.length > 0 && adminDomains.includes(userDomain);
-    
-    // 본인 영상이 아니고 관리자도 아니면 거부
-    if (packing.user_profile_id !== user.id && !isAdmin) {  // user_id 대신 user_profile_id
+    // 같은 회사의 영상이 아니면 거부
+    if (packing.company_id !== req.company.id) {
       return res.status(403).json({ error: '접근 권한이 없습니다.' });
     }
     
@@ -302,7 +482,7 @@ app.post('/get-video-url', async (req, res) => {
       expiresIn: 3600, // 1시간
     });
     
-    console.log(`Video URL generated for user ${user.email}, key: ${key}`);
+    console.log(`Video URL generated for worker ${req.worker.username}, key: ${key}`);
     
     res.json({
       url,
