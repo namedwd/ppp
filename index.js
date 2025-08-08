@@ -99,12 +99,15 @@ app.get('/', (req, res) => {
 app.post('/worker-login', async (req, res) => {
   const { username, password } = req.body;
   
+  console.log('Login attempt:', { username, passwordLength: password?.length });
+  
   if (!username || !password) {
     return res.status(400).json({ error: '아이디와 비밀번호를 입력해주세요.' });
   }
   
   try {
     // 작업자 계정 조회
+    console.log('Searching for worker:', username);
     const { data: worker, error: workerError } = await supabase
       .from('worker_accounts')
       .select(`
@@ -115,12 +118,19 @@ app.post('/worker-login', async (req, res) => {
       .eq('is_active', true)
       .single();
     
+    console.log('Worker search result:', { found: !!worker, error: workerError });
+    
     if (workerError || !worker) {
+      console.log('Worker not found:', workerError);
       return res.status(401).json({ error: '아이디 또는 비밀번호가 올바르지 않습니다.' });
     }
     
     // 비밀번호 확인
+    console.log('Checking password...');
+    console.log('Password hash from DB:', worker.password_hash);
     const isValidPassword = await bcrypt.compare(password, worker.password_hash);
+    console.log('Password valid:', isValidPassword);
+    
     if (!isValidPassword) {
       return res.status(401).json({ error: '아이디 또는 비밀번호가 올바르지 않습니다.' });
     }
