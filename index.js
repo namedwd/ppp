@@ -305,12 +305,9 @@ async function authenticateWorker(req, res, next) {
       .from('worker_sessions')
       .select(`
         *,
-        worker_accounts!inner(
-          *,
-          organization_id
-        )
+        worker:worker_accounts(*)
       `)
-      .eq('session_token', token)
+      .eq('token', token)
       .gt('expires_at', new Date().toISOString())
       .single();
     
@@ -320,24 +317,24 @@ async function authenticateWorker(req, res, next) {
     }
     
     // 활성 상태 확인
-    if (!session.worker_accounts.is_active) {
+    if (!session.worker.is_active) {
       return res.status(403).json({ error: '비활성화된 계정입니다.' });
     }
     
     // 회사 정보 조회
-    const { data: org, error: orgError } = await supabase
-      .from('organizations')
+    const { data: company, error: companyError } = await supabase
+      .from('companies')
       .select('*')
-      .eq('id', session.worker_accounts.organization_id)
+      .eq('id', session.worker.company_id)
       .single();
     
-    if (orgError || !org) {
+    if (companyError || !company) {
       return res.status(500).json({ error: '회사 정보를 찾을 수 없습니다.' });
     }
     
     // 요청 객체에 작업자 정보 추가
-    req.worker = session.worker_accounts;
-    req.company = org;
+    req.worker = session.worker;
+    req.company = company;
     
     next();
   } catch (error) {
@@ -494,15 +491,17 @@ app.post('/confirm-upload', authenticateWorker, async (req, res) => {
       return res.status(400).json({ error: '필수 필드가 누락되었습니다.' });
     }
     
-    // Supabase에 업로드 정보 저장 (video_uploads 테이블)
-    const { error: insertError } = await supabase.from('video_uploads').insert({
-      barcode,      
-      file_name: key.split('/').pop(),
-      file_url: key,
-      file_size: fileSize || 0,
-      duration: duration || 0,
+    // Supabase에 업로드 정보 저장 (packing_records 테이블)
+    const { error: insertError } = await supabase.from('packing_records').insert({
+      company_id: req.company.id,
       worker_id: req.worker.id,
-      organization_id: req.company.id,
+      order_number: barcode,
+      video_url: key,
+      video_filename: key.split('/').pop(),
+      video_size: fileSize || 0,
+      video_duration: duration || 0,
+      status: 'completed',
+      recorded_at: started_at || new Date().toISOString(),
       metadata: {
         started_at: started_at || new Date().toISOString(),
         ended_at: ended_at || new Date().toISOString(),
@@ -515,6 +514,7 @@ app.post('/confirm-upload', authenticateWorker, async (req, res) => {
       return res.status(500).json({ error: 'DB 저장 중 오류가 발생했습니다.' });
     }
     
+    console.log(`Upload confirmed: ${barcode} by worker ${req.worker.username}`);
     res.json({ message: '업로드가 확인되었습니다.' });
     
   } catch (error) {
@@ -567,9 +567,9 @@ app.post('/get-video-url', authenticateWorker, async (req, res) => {
     
     // 권한 확인: 같은 회사의 영상인지 확인
     const { data: video, error: dbError } = await supabase
-      .from('video_uploads')
-      .select('organization_id, worker_id')
-      .eq('file_url', key)
+      .from('packing_records')
+      .select('company_id, worker_id')
+      .eq('video_url', key)
       .single();
     
     if (dbError || !video) {
@@ -577,7 +577,7 @@ app.post('/get-video-url', authenticateWorker, async (req, res) => {
     }
     
     // 같은 회사의 영상이 아니면 거부
-    if (video.organization_id !== req.company.id) {
+    if (video.company_id !== req.company.id) {
       return res.status(403).json({ error: '접근 권한이 없습니다.' });
     }
     
