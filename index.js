@@ -321,6 +321,8 @@ app.post('/confirm-upload', authenticateWorker, async (req, res) => {
       video_size: fileSize || 0,
       video_duration: duration || 0,
       status: 'completed',
+      remux_status: duration && duration <= 1 ? 'skipped' : 'pending',  // 1초 이하는 자동 스킵
+      remux_attempts: 0,
       recorded_at: started_at || new Date().toISOString(),
       metadata: {
         started_at: started_at || new Date().toISOString(),
